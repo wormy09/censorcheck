@@ -15,22 +15,49 @@ PROXY=""
 VERBOSE=false
 DEBUG=false
 
-RIPE_API_KEY="Insert the key" # Не берите ключ, пожалуйста, можете создать свой на atlas.ripe, это не сложно
-REALITY_SNI="max.ru"
+# Ключ RIPE Atlas. Приоритет: --key > $RIPE_API_KEY из окружения > пусто.
+# Свой ключ: https://atlas.ripe.net/keys/ (право "Create a new measurement")
+RIPE_API_KEY="${RIPE_API_KEY:-}"
+SNI_EXPLICIT=false         # true, если SNI задан флагом или переменной
+if [[ -n "${CENSORCHECK_SNI:-}" ]]; then
+  REALITY_SNI="$CENSORCHECK_SNI"
+  SNI_EXPLICIT=true
+else
+  REALITY_SNI="max.ru"
+fi
+RADAR_TARGET=""            # по умолчанию — внешний IPv4 этой машины
+RADAR_DEADLINE=240         # сек, сколько ждать результаты зондов
+SKIP_LISTEN_CHECK=false
+ASK_KEY=true               # спрашивать ключ, если он нигде не задан
+
+usage() {
+  cat <<'USAGE'
+censorcheck.sh [опции]
+
+  -v, --verbose            подробный вывод по доменам
+  -d, --debug              debug-лог радара (RIPE Atlas)
+  -k, --key <uuid>         ключ RIPE Atlas (или переменная RIPE_API_KEY)
+  -s, --sni <hostname>     SNI для TLS-хендшейка зондов (иначе спросит, default max.ru)
+  -t, --target <ip>        проверять чужой IP, а не свой (включает --no-listen-check)
+      --timeout <sec>      ожидание результатов, по умолчанию 240
+      --no-listen-check    не проверять, слушает ли кто-то :443 локально
+      --no-prompt          ничего не спрашивать интерактивно: ни ключ, ни SNI (для cron)
+  -h, --help               эта справка
+USAGE
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    -v|--verbose)
-      VERBOSE=true
-      shift
-      ;;
-    -d|--debug)
-      DEBUG=true
-      shift
-      ;;
-    *)
-      shift
-      ;;
+    -v|--verbose)      VERBOSE=true; shift ;;
+    -d|--debug)        DEBUG=true; shift ;;
+    -k|--key)          RIPE_API_KEY="$2"; shift 2 ;;
+    -s|--sni)          REALITY_SNI="$2"; SNI_EXPLICIT=true; shift 2 ;;
+    -t|--target)       RADAR_TARGET="$2"; SKIP_LISTEN_CHECK=true; shift 2 ;;
+    --timeout)         RADAR_DEADLINE="$2"; shift 2 ;;
+    --no-listen-check) SKIP_LISTEN_CHECK=true; shift ;;
+    --no-prompt)       ASK_KEY=false; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    *) shift ;;
   esac
 done
 
@@ -467,11 +494,111 @@ animate() {
   done
 }
 
+# ----------------------------------------------------------------- RIPE key
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/censorcheck"
+KEY_FILE="$CONFIG_DIR/key"
+
+save_ripe_key() {
+  ( umask 077; mkdir -p "$CONFIG_DIR" && printf '%s\n' "$1" > "$KEY_FILE" ) 2>/dev/null
+}
+
+# Порядок: --key / $RIPE_API_KEY  ->  сохранённый ключ  ->  запрос у пользователя
+resolve_ripe_key() {
+  local answer
+
+  [[ "$RIPE_API_KEY" == "Insert the key" ]] && RIPE_API_KEY=""
+
+  if [[ -z "$RIPE_API_KEY" && -r "$KEY_FILE" ]]; then
+    RIPE_API_KEY=$(tr -d '[:space:]' < "$KEY_FILE" 2>/dev/null)
+    [[ -n "$RIPE_API_KEY" ]] && echo -e "${DIM}Ключ RIPE Atlas взят из ${KEY_FILE}${RESET}"
+  fi
+
+  [[ -n "$RIPE_API_KEY" ]] && return 0
+  [[ "$ASK_KEY" != true ]] && return 1
+
+  # stdin занят самим скриптом при запуске через `wget -qO- ... | bash`,
+  # поэтому открываем управляющий терминал отдельным дескриптором.
+  # Проверка [[ -r /dev/tty ]] тут не годится: она проходит и без tty,
+  # а падает уже сам open (ENXIO).
+  # порядок важен: 2>/dev/null должен применяться раньше самого open
+  { exec 9<>/dev/tty; } 2>/dev/null || return 1
+
+  {
+    echo
+    echo -e "${CYAN}Радар ТСПУ${RESET} — проверка вашего IP из сетей РФ через зонды RIPE Atlas."
+    echo -e "${DIM}Нужен personal API key: https://atlas.ripe.net/keys/${RESET}"
+    echo -e "${DIM}Право доступа: «Create a new measurement». Ключ никуда не отправляется, кроме atlas.ripe.net${RESET}"
+    echo -ne "${YELLOW}Ключ RIPE Atlas${RESET} ${DIM}(Enter — пропустить радар):${RESET} "
+  } >&9
+
+  IFS= read -r answer <&9 || { echo >&9; exec 9>&-; return 1; }
+  answer=$(printf '%s' "$answer" | tr -d '[:space:]')
+
+  if [[ -z "$answer" ]]; then
+    echo -e "${DIM}Радар ТСПУ пропущен. Домены всё равно проверю.${RESET}" >&9
+    echo >&9
+    exec 9>&-
+    return 1
+  fi
+
+  RIPE_API_KEY="$answer"
+  if [[ ! "$RIPE_API_KEY" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo -e "${DIM}Не похоже на UUID — пробую как есть.${RESET}" >&9
+  fi
+
+  echo -ne "${DIM}Запомнить ключ в ${KEY_FILE}? [Y/n]:${RESET} " >&9
+  IFS= read -r answer <&9 || answer=""
+  if [[ -z "$answer" || "$answer" =~ ^[YyДд] ]]; then
+    if save_ripe_key "$RIPE_API_KEY"; then
+      echo -e "${DIM}Сохранено, права 600. Удалить: rm ${KEY_FILE}${RESET}" >&9
+    else
+      echo -e "${DIM}Сохранить не вышло — ключ используется только в этом запуске.${RESET}" >&9
+    fi
+  fi
+  echo >&9
+  exec 9>&-
+  return 0
+}
+
+# SNI спрашиваем только если он не задан явно и радар вообще будет запускаться.
+# Значение НЕ сохраняется: оно своё для каждой ноды, в отличие от ключа.
+resolve_sni() {
+  local answer
+  [[ "$SNI_EXPLICIT" == true ]] && return 0
+  [[ "$ASK_KEY" != true ]] && return 0
+  { exec 9<>/dev/tty; } 2>/dev/null || return 0
+
+  {
+    echo -e "${DIM}SNI, который зонды пошлют в TLS Client Hello. Для REALITY-ноды —"
+    echo -e "то же имя, что стоит в serverNames инбаунда (например www.transip.nl).${RESET}"
+    echo -ne "${YELLOW}SNI${RESET} ${DIM}[Enter — ${REALITY_SNI}]:${RESET} "
+  } >&9
+
+  IFS= read -r answer <&9 || answer=""
+  answer=$(printf '%s' "$answer" | tr -d '[:space:]')
+
+  if [[ -n "$answer" ]]; then
+    if [[ "$answer" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      REALITY_SNI="$answer"
+    else
+      echo -e "${DIM}Это не похоже на имя хоста, оставляю ${REALITY_SNI}${RESET}" >&9
+    fi
+  fi
+
+  echo >&9
+  exec 9>&-
+  return 0
+}
+
 clear
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo -e " ${YELLOW}◆${RESET}          ${BLUE}Network Censorship Checker${RESET}  ${DIM}·${RESET}  ${YELLOW}by Nikola Tesla${RESET}          ${YELLOW}◆${RESET} "
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo
+
+if resolve_ripe_key; then
+  resolve_sni
+fi
 
 printf "%-${DOMAIN_WIDTH}s  %-8s %s\n" "Domain" "Status" "Block Type"
 echo "$LINE_SEP"
@@ -535,133 +662,193 @@ if [[ -n "$CURRENT_ASN" ]]; then
 fi
 echo
 
-if [[ -n "$CURRENT_IP" ]] && [[ -n "$RIPE_API_KEY" ]]; then
+if [[ -n "$CURRENT_IP" ]]; then
   echo "$LINE_SEP"
-  
-  # Чекер 443 порта, нужен для Atlas
-  if ! ss -tuln 2>/dev/null | grep -qE "(0\.0\.0\.0|\*|$CURRENT_IP):443\b"; then
-    echo -e "${DIM}Радар ТСПУ отменен. Для корректной проверки запустите VPN (Xray/3X-UI)${RESET}"
+
+  RADAR_IP="${RADAR_TARGET:-$CURRENT_IP}"
+
+  if [[ -z "$RIPE_API_KEY" || "$RIPE_API_KEY" == "Insert the key" ]]; then
+    echo -e "${YELLOW}Радар ТСПУ пропущен: не задан ключ RIPE Atlas.${RESET}"
+    echo -e "${DIM}Создайте ключ на https://atlas.ripe.net/keys/ (право Create measurement) и запустите:${RESET}"
+    echo -e "${DIM}  ./censorcheck.sh --key <uuid>   либо   export RIPE_API_KEY=<uuid>${RESET}"
+
+  elif [[ "$SKIP_LISTEN_CHECK" == false ]] && ! ss -tuln 2>/dev/null | grep -qE "(0\.0\.0\.0|\[::\]|\*|$CURRENT_IP):443([[:space:]]|$)"; then
+    echo -e "${DIM}Радар ТСПУ отменен: на :443 никто не слушает.${RESET}"
+    echo -e "${DIM}Запустите VPN/веб-сервер, либо --no-listen-check / --target <ip>${RESET}"
+
   else
     echo -e "Опрос сетей РФ: РТК, МТС, МГТС, Билайн, ТТК, РТК-Юг, Мегафон .."
-    
+    echo -e "${DIM}Цель: ${RADAR_IP}:443   SNI: ${REALITY_SNI}${RESET}"
+
     TMP_ATLAS=$(mktemp)
     TMP_ATLAS_DEBUG=$(mktemp)
-    python3 -c "
-import sys, json, time, urllib.request
+    python3 - "$RIPE_API_KEY" "$RADAR_IP" "$REALITY_SNI" "$DEBUG" "$RADAR_DEADLINE" \
+      > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" <<'PYRADAR' &
+import sys, json, time, urllib.request, urllib.error
 
-api_key = sys.argv[1]
+api_key   = sys.argv[1]
 target_ip = sys.argv[2]
-sni = sys.argv[3]
-debug = (len(sys.argv) > 4 and sys.argv[4] == 'true')
+sni       = sys.argv[3]
+debug     = (len(sys.argv) > 4 and sys.argv[4] == 'true')
+deadline  = int(sys.argv[5]) if len(sys.argv) > 5 else 240
+
+API = 'https://atlas.ripe.net/api/v2'
 
 def dlog(msg):
     if debug:
-        print(f'[DEBUG] {msg}', file=sys.stderr, flush=True)
+        print('[DEBUG] ' + str(msg), file=sys.stderr, flush=True)
 
-dlog(f'target_ip={target_ip} sni={sni}')
+def api_get(path, key=None, timeout=25):
+    req = urllib.request.Request(API + path)
+    if key:
+        req.add_header('Authorization', 'Key ' + key)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
 
-url = 'https://atlas.ripe.net/api/v2/measurements/'
-data = {
+# --- 1. ключ живой? сколько кредитов? -------------------------------------
+if not api_key or api_key.strip() in ('', 'Insert the key', 'YOUR_KEY'):
+    print('ERROR NOKEY')
+    sys.exit(0)
+
+balance = -1
+try:
+    balance = api_get('/credits/', api_key).get('current_balance', -1)
+    dlog('credit balance = ' + str(balance))
+except urllib.error.HTTPError as e:
+    body = e.read().decode('utf-8', 'replace')[:200]
+    dlog('credits HTTP ' + str(e.code) + ': ' + body)
+    # 401 = такого ключа нет -> дальше идти бессмысленно.
+    # 403 = ключ валиден, но у него нет прав на /credits/ (отдельного
+    # разрешения для кредитов в списке нет) -> не фатально, просто
+    # пропускаем проверку баланса и пробуем создать измерение.
+    if e.code == 401:
+        print('ERROR AUTH 401')
+        sys.exit(0)
+    dlog('no permission to read credits, skipping balance check')
+except Exception as e:
+    dlog('credits check failed: ' + repr(e))
+
+# --- 2. сколько зондов реально доступно в каждой ASN? ---------------------
+WANT = [(12389,3),(8402,5),(25513,5),(8359,3),(3216,3),(20485,2),
+        (25490,1),(43727,1),(12714,4),(34757,2),(29124,2),(12768,2)]
+
+probe_defs = []
+expected = 0
+for asn, want in WANT:
+    try:
+        q = '/probes/?asn_v4=%d&status=1&tags=system-ipv4-works&page_size=1' % asn
+        avail = api_get(q).get('count', 0)
+    except Exception as e:
+        dlog('AS%d probe count failed (%r), assuming %d' % (asn, e, want))
+        avail = want
+    use = min(want, avail)
+    dlog('AS%-6d want=%d avail=%s use=%d' % (asn, want, avail, use))
+    if use > 0:
+        probe_defs.append({'requested': use, 'type': 'asn', 'value': asn,
+                           'tags': {'include': ['system-ipv4-works']}})
+        expected += use
+
+if not probe_defs:
+    print('ERROR NOPROBES')
+    sys.exit(0)
+
+est_cost = expected * 20   # sslcert: 20 кредитов на зонд (проверено на реальном отказе API)
+if 0 <= balance < est_cost:
+    print('ERROR CREDITS %d %d' % (balance, est_cost))
+    sys.exit(0)
+
+# --- 3. создаём измерение -------------------------------------------------
+payload = {
     'definitions': [{
-        'target': target_ip, 
-        'description': 'Reality TLS Handshake',
+        'target': target_ip,
+        'description': 'censorcheck TLS radar ' + sni,
         'type': 'sslcert',
         'port': 443,
         'hostname': sni,
-        'af': 4
+        'af': 4,
     }],
-    'probes': [
-        {'requested': 3, 'type': 'asn', 'value': 12389, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 5, 'type': 'asn', 'value': 8402,  'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 5, 'type': 'asn', 'value': 25513, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 3, 'type': 'asn', 'value': 8359,  'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 3, 'type': 'asn', 'value': 3216,  'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 20485, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 1, 'type': 'asn', 'value': 25490, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 1, 'type': 'asn', 'value': 43727, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 4, 'type': 'asn', 'value': 12714, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 34757, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 29124, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 12768, 'tags': {'include': ['system-ipv4-works']}}
-    ],
-    'is_oneoff': True
+    'probes': probe_defs,
+    'is_oneoff': True,
 }
-
-req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), 
-                             headers={'Content-Type': 'application/json', 'Authorization': f'Key {api_key}'})
+req = urllib.request.Request(
+    API + '/measurements/',
+    data=json.dumps(payload).encode('utf-8'),
+    headers={'Content-Type': 'application/json', 'Authorization': 'Key ' + api_key})
 try:
-    with urllib.request.urlopen(req) as response:
-        resp_data = json.loads(response.read().decode())
-        msm_id = resp_data['measurements'][0]
-        dlog(f'measurement_id={msm_id}')
+    with urllib.request.urlopen(req, timeout=30) as r:
+        msm_id = json.loads(r.read().decode())['measurements'][0]
+    dlog('measurement id = %s (expecting %d probes)' % (msm_id, expected))
+except urllib.error.HTTPError as e:
+    body = e.read().decode('utf-8', 'replace').replace('\n', ' ')[:300]
+    dlog('create HTTP %d: %s' % (e.code, body))
+    print('ERROR CREATE %d %s' % (e.code, body))
+    sys.exit(0)
 except Exception as e:
-    dlog(f'API create error: {type(e).__name__}: {e}')
-    print('ERROR API_FAIL')
+    dlog('create failed: ' + repr(e))
+    print('ERROR CREATE 0 ' + type(e).__name__)
     sys.exit(0)
 
-results_url = f'https://atlas.ripe.net/api/v2/measurements/{msm_id}/results/'
+# --- 4. ждём результаты ---------------------------------------------------
 results = []
-start_time = time.time()
-
-for attempt in range(25):
-    time.sleep(2)
+t0 = time.time()
+last_n = -1
+stable_since = None
+while time.time() - t0 < deadline:
+    time.sleep(3)
     try:
-        with urllib.request.urlopen(results_url) as response:
-            results = json.loads(response.read().decode())
-            elapsed = int(time.time() - start_time)
-            dlog(f'poll {attempt+1}/25 [{elapsed}s]: results={len(results)}/33')
-            if len(results) >= 33: 
-                break
+        results = api_get('/measurements/%s/results/' % msm_id, api_key)
     except Exception as e:
-        dlog(f'poll {attempt+1} error: {type(e).__name__}: {e}')
-
-if debug:
-    dlog(f'FINAL: total={len(results)} after {int(time.time()-start_time)}s')
-    for i, probe in enumerate(results):
-        prb_id = probe.get('prb_id', '?')
-        asn = probe.get('asn', '?')
-        keys = [k for k in ('cert','method','alert','err') if k in probe]
-        err = probe.get('err', '')
-        dlog(f'  probe[{i}] prb_id={prb_id} asn={asn} keys={keys} err={err!r}')
+        dlog('poll error: ' + repr(e))
+        continue
+    n = len(results)
+    dlog('poll t=%3ds  results=%d/%d' % (int(time.time() - t0), n, expected))
+    if n >= expected:
+        break
+    if n == last_n and n > 0:
+        if stable_since is None:
+            stable_since = time.time()
+        elif time.time() - stable_since > 45:
+            dlog('count stable %ds, stopping early' % 45)
+            break
+    else:
+        stable_since = None
+        last_n = n
 
 if not results:
-    print('ERROR NO_DATA')
+    print('ERROR NODATA %d %d' % (expected, int(time.time() - t0)))
     sys.exit(0)
 
-blocked = 0
-blocked_prb_ids = []
-for probe in results:
-    if 'cert' in probe or 'method' in probe or 'alert' in probe:
-        pass 
+# --- 5. классификация -----------------------------------------------------
+blocked_ids = []
+ok = 0
+for p in results:
+    if 'cert' in p or 'method' in p or 'alert' in p:
+        ok += 1
     else:
-        blocked += 1
-        prb_id = probe.get('prb_id')
-        if prb_id:
-            blocked_prb_ids.append(prb_id)
+        pid = p.get('prb_id')
+        if pid:
+            blocked_ids.append(pid)
 
 total = len(results)
-success = total - blocked
-print(f'OK {total} {success} {blocked}')
+print('OK %d %d %d %d' % (total, ok, total - ok, expected))
 
 blocked_asns = {}
-if blocked_prb_ids:
+if blocked_ids:
     try:
-        ids_str = ','.join(str(p) for p in blocked_prb_ids)
-        probes_url = f'https://atlas.ripe.net/api/v2/probes/?id__in={ids_str}&fields=id,asn_v4'
-        with urllib.request.urlopen(probes_url, timeout=10) as response:
-            probe_info = json.loads(response.read().decode())
-            for p in probe_info.get('results', []):
-                asn = p.get('asn_v4')
-                if asn:
-                    blocked_asns[asn] = blocked_asns.get(asn, 0) + 1
-            dlog(f'blocked asns: {blocked_asns}')
+        ids = ','.join(str(i) for i in blocked_ids)
+        info = api_get('/probes/?id__in=%s&fields=id,asn_v4&page_size=100' % ids, api_key)
+        for p in info.get('results', []):
+            a = p.get('asn_v4')
+            if a:
+                blocked_asns[a] = blocked_asns.get(a, 0) + 1
+        dlog('blocked asns: ' + str(blocked_asns))
     except Exception as e:
-        dlog(f'probe info error: {type(e).__name__}: {e}')
+        dlog('probe lookup failed: ' + repr(e))
 
 if blocked_asns:
-    parts = ' '.join(f'{asn}:{cnt}' for asn, cnt in blocked_asns.items())
-    print(f'BLOCKED_ASN {parts}')
-    " "$RIPE_API_KEY" "$CURRENT_IP" "$REALITY_SNI" "$DEBUG" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
+    print('BLOCKED_ASN ' + ' '.join('%d:%d' % (a, c) for a, c in blocked_asns.items()))
+PYRADAR
+
     
     ATLAS_PID=$!
 
@@ -698,11 +885,13 @@ if blocked_asns:
     FIRST_LINE=$(echo "$ATLAS_RESULT" | head -n1)
     BLOCKED_ASN_LINE=$(echo "$ATLAS_RESULT" | grep "^BLOCKED_ASN" | head -n1)
     STATUS=$(echo "$FIRST_LINE" | awk '{print $1}')
+    STATUS_CODE=$(echo "$FIRST_LINE" | awk '{print $2}')
 
     if [[ "$STATUS" == "OK" ]]; then
       TOTAL_PROBES=$(echo "$FIRST_LINE" | awk '{print $2}')
       SUCCESS_PROBES=$(echo "$FIRST_LINE" | awk '{print $3}')
       BLOCKED_PROBES=$(echo "$FIRST_LINE" | awk '{print $4}')
+      EXPECTED_PROBES=$(echo "$FIRST_LINE" | awk '{print $5}')
       
       if (( TOTAL_PROBES > 0 )); then
         SUCCESS_PERCENT=$(( SUCCESS_PROBES * 100 / TOTAL_PROBES ))
@@ -721,7 +910,11 @@ if blocked_asns:
         STAT_TEXT="КРИТИЧНАЯ БЛОКИРОВКА ТСПУ (IP недоступен)"
       fi
 
-      echo -e "Зондов ответило: ${CYAN}${TOTAL_PROBES}${RESET} | Пробились: ${GREEN}${SUCCESS_PROBES}${RESET} | Заблокированы: ${RED}${BLOCKED_PROBES}${RESET}"
+      PROBE_TALLY="${TOTAL_PROBES}"
+      if [[ -n "$EXPECTED_PROBES" ]] && (( EXPECTED_PROBES > TOTAL_PROBES )); then
+        PROBE_TALLY="${TOTAL_PROBES}/${EXPECTED_PROBES}"
+      fi
+      echo -e "Зондов ответило: ${CYAN}${PROBE_TALLY}${RESET} | Пробились: ${GREEN}${SUCCESS_PROBES}${RESET} | Заблокированы: ${RED}${BLOCKED_PROBES}${RESET}"
       echo -e "ТСПУ Статус: ${COLOR}${SUCCESS_PERCENT}% ${STAT_TEXT}${RESET}"
 
       if [[ -n "$BLOCKED_ASN_LINE" ]]; then
@@ -777,7 +970,23 @@ if blocked_asns:
       fi
 
     else
-      echo -e "${YELLOW}Не удалось получить данные, попробуйте позже${RESET}"
+      ERR_DETAIL=$(echo "$FIRST_LINE" | cut -d" " -f3-)
+      case "$STATUS_CODE" in
+        NOKEY)
+          echo -e "${YELLOW}Ключ RIPE Atlas не задан.${RESET} ${DIM}--key <uuid> или export RIPE_API_KEY${RESET}" ;;
+        AUTH)
+          echo -e "${RED}Ключ RIPE Atlas отклонён (HTTP ${ERR_DETAIL}).${RESET} ${DIM}Проверьте права ключа: нужен Create measurement${RESET}" ;;
+        CREDITS)
+          echo -e "${RED}Недостаточно кредитов RIPE Atlas.${RESET} ${DIM}Баланс/нужно: ${ERR_DETAIL}${RESET}" ;;
+        NOPROBES)
+          echo -e "${RED}Нет активных зондов ни в одной из целевых ASN.${RESET}" ;;
+        CREATE)
+          echo -e "${RED}RIPE Atlas отклонил измерение:${RESET} ${DIM}${ERR_DETAIL}${RESET}" ;;
+        NODATA)
+          echo -e "${YELLOW}Зонды не вернули результат за отведённое время.${RESET} ${DIM}(ожидалось ${ERR_DETAIL% *} зондов) Попробуйте --timeout 420${RESET}" ;;
+        *)
+          echo -e "${YELLOW}Не удалось получить данные, попробуйте позже${RESET} ${DIM}(запустите с -d)${RESET}" ;;
+      esac
     fi
 
     if $DEBUG && [[ -s "$TMP_ATLAS_DEBUG" ]]; then
