@@ -796,6 +796,7 @@ alert_ids = []
 blocked_prb_ids = []
 all_prb_ids = []
 alert_desc = {}
+blocked_err = {}
 for probe in results:
     pid = probe.get('prb_id')
     if pid:
@@ -809,6 +810,10 @@ for probe in results:
         alert_desc[k] = alert_desc.get(k, 0) + 1
     else:
         blocked_prb_ids.append(pid)
+        # `connect: timeout` (SYN в никуда = блэкхол/бан IP) и `timeout reading
+        # hello` (TCP есть, режут ClientHello = DPI по SNI) — это РАЗНЫЕ вещи
+        e = str(probe.get('err', 'no data')).strip() or 'no data'
+        blocked_err[e] = blocked_err.get(e, 0) + 1
 
 total = len(results)
 blocked = len(blocked_prb_ids)
@@ -816,6 +821,8 @@ print('OK ' + str(total) + ' ' + str(len(cert_ids)) + ' ' + str(blocked) +
       ' ' + str(len(alert_ids)), flush=True)
 if alert_desc:
     print('ALERT_DESC ' + ' '.join(k + ':' + str(v) for k, v in alert_desc.items()), flush=True)
+for k, v in sorted(blocked_err.items(), key=lambda kv: -kv[1]):
+    print('BLOCK_ERR ' + str(v) + ' ' + k, flush=True)
 
 # ASN для ВСЕХ ответивших, а не только для заблокированных: без этого нельзя
 # сказать, какие сети вообще участвовали, а какие молча не ответили
@@ -962,6 +969,27 @@ PYEOF
       echo -e "Зондов ответило: ${COV_COLOR}${TOTAL_PROBES} из ${SCHEDULED}${RESET} ${DIM}(покрытие ${COVERAGE}%)${RESET}"
       echo -e "Пробились: ${GREEN}${SUCCESS_PROBES}${RESET} | Заблокированы: ${RED}${BLOCKED_PROBES}${RESET} | TLS-alert: ${YELLOW}${ALERT_PROBES}${RESET}"
 
+      if (( BLOCKED_PROBES > 0 )); then
+        echo "$ATLAS_RESULT" | grep '^BLOCK_ERR ' | while read -r _tag _cnt _err; do
+          case "$_err" in
+            connect:\ timeout*)
+              _hint="SYN уходит, ответа нет — блэкхол на уровне IP (бан оператором)" ;;
+            timeout\ reading\ hello*)
+              _hint="TCP поднялся, режут ClientHello — DPI по SNI (ТСПУ)" ;;
+            connect:\ connection\ refused*)
+              _hint="хост жив, порт закрыт — это не блокировка" ;;
+            connect:\ network\ unreachable*)
+              _hint="нет маршрута до сети" ;;
+            *) _hint="" ;;
+          esac
+          if [[ -n "$_hint" ]]; then
+            echo -e "${DIM}  ${_cnt} × ${_err} — ${_hint}${RESET}"
+          else
+            echo -e "${DIM}  ${_cnt} × ${_err}${RESET}"
+          fi
+        done
+      fi
+
       if (( ALERT_PROBES > 0 )); then
         ADESC=${ALERT_DESC_LINE#ALERT_DESC }
         AOUT=""
@@ -983,8 +1011,8 @@ PYEOF
           echo -e "${YELLOW}  alert 112 = сервер не знает такой SNI — проверьте --sni ${REALITY_SNI}${RESET}"
         else
           echo -e "${DIM}  обычно это старая прошивка зонда с легаси-шифрами, а не блокировка:${RESET}"
-          echo -e "${DIM}  проверить можно с нейтральной точки — openssl s_client -tls1_2 \\${RESET}"
-          echo -e "${DIM}    -cipher 'AES128-SHA:AES256-SHA' -servername ${REALITY_SNI} -connect ${RADAR_IP}:${RADAR_PORT}${RESET}"
+          echo -e "${DIM}  проверить можно с нейтральной точки:${RESET}"
+          echo -e "${DIM}  openssl s_client -tls1_2 -cipher 'AES128-SHA:AES256-SHA' -servername ${REALITY_SNI} -connect ${RADAR_IP}:${RADAR_PORT}${RESET}"
           echo -e "${DIM}  тот же alert оттуда = дело в шифрах, а не в ТСПУ. В вердикт не входят.${RESET}"
         fi
       fi
