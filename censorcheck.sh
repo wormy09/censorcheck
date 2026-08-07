@@ -936,6 +936,16 @@ PYEOF
       # (старая прошивка зонда с легаси-шифрами), а не блокировки
       VERDICT_BASE=$(( SUCCESS_PROBES + BLOCKED_PROBES ))
       
+      # Какая доля ОТВЕТИВШИХ зондов вообще попадает в вердикт. Исключать
+      # TLS-alert правильно (это свойство клиента или SNI, не блокировка), но
+      # если алертов почти все, вердикт считается по единицам зондов и врет:
+      # 1 пробившийся из базы в 1 зонд давал "100% ПОЛНЫЙ ДОСТУП".
+      if (( TOTAL_PROBES > 0 )); then
+        VERDICT_SHARE=$(( VERDICT_BASE * 100 / TOTAL_PROBES ))
+      else
+        VERDICT_SHARE=0
+      fi
+
       if (( VERDICT_BASE > 0 )); then
         SUCCESS_PERCENT=$(( SUCCESS_PROBES * 100 / VERDICT_BASE ))
       else
@@ -1023,6 +1033,13 @@ PYEOF
         echo -e "ТСПУ Статус: ${YELLOW}НЕДОСТАТОЧНО ДАННЫХ${RESET} ${DIM}(ответило ${COVERAGE}% зондов, порог ${RADAR_MIN_COVERAGE}%)${RESET}"
         echo -e "${DIM}Среди ответивших пробились ${SUCCESS_PERCENT}%, но выборки ${TOTAL_PROBES} зондов мало для вывода.${RESET}"
         echo -e "${DIM}Результаты дособираются: увеличьте --timeout, либо смотрите измерение на atlas.ripe.net${RESET}"
+      elif (( VERDICT_SHARE < 50 )); then
+        echo -e "ТСПУ Статус: ${YELLOW}ВЕРДИКТ НЕ ВЫНЕСЕН${RESET} ${DIM}(оценка легла бы на ${VERDICT_BASE} зондов из ${TOTAL_PROBES} ответивших)${RESET}"
+        echo -e "${DIM}Остальные ${ALERT_PROBES} вернули TLS-alert и в вердикт не входят — этот прогон измерил не блокировку.${RESET}"
+        if [[ "$ALERT_DESC_LINE" == *112* ]]; then
+          echo -e "${YELLOW}Почти все зонды получили unrecognized_name: SNI ${REALITY_SNI} сервер не обслуживает.${RESET}"
+          echo -e "${YELLOW}Перезапустите с правильным --sni — до этого о доступности сказать нечего.${RESET}"
+        fi
       else
         echo -e "ТСПУ Статус: ${COLOR}${SUCCESS_PERCENT}% ${STAT_TEXT}${RESET}"
       fi
