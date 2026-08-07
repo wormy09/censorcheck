@@ -655,6 +655,11 @@ def dlog(msg):
     if debug:
         print(f'[DEBUG] {msg}', file=sys.stderr, flush=True)
 
+def api_get(u, timeout=15):
+    req = urllib.request.Request(u, headers={'Authorization': 'Key ' + api_key})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
 dlog(f'target_ip={target_ip} port={port} sni={sni} deadline={deadline_s}')
 
 BASE = 'https://atlas.ripe.net/api/v2'
@@ -685,6 +690,37 @@ except urllib.error.HTTPError as e:
 except Exception as e:
     dlog(f'credits check failed: {type(e).__name__}: {e}')
 
+# Сколько зондов реально подключено в каждой сети. Список ASN тот же, что был,
+# но просить больше, чем есть, бессмысленно: Atlas назначит меньше, а опрос
+# будет ждать недостающих до самого дедлайна. Доступность меняется ежедневно.
+WANTED = [
+    (12389, 3), (8402, 5), (25513, 5), (8359, 3), (3216, 3), (20485, 2),
+    (25490, 1), (43727, 1), (12714, 4), (34757, 2), (29124, 2), (12768, 2),
+]
+
+probes = []
+requested_total = 0
+for asn, want in WANTED:
+    try:
+        u = (BASE + '/probes/?asn_v4=' + str(asn) +
+             '&status=1&tags=system-ipv4-works&format=json&fields=id')
+        have = api_get(u, timeout=10).get('count', 0)
+    except Exception as e:
+        dlog(f'probe count AS{asn} failed: {type(e).__name__}')
+        have = want   # не знаем — просим сколько хотели, пусть решает Atlas
+    take = min(want, have)
+    dlog(f'AS{asn} want={want} connected={have} take={take}')
+    if take > 0:
+        probes.append({'requested': take, 'type': 'asn', 'value': asn,
+                       'tags': {'include': ['system-ipv4-works']}})
+        requested_total += take
+
+if requested_total == 0:
+    print('ERROR NOPROBES', flush=True)
+    sys.exit(0)
+
+dlog(f'requested_total={requested_total}')
+
 url = BASE + '/measurements/'
 data = {
     'definitions': [{
@@ -695,20 +731,7 @@ data = {
         'hostname': sni,
         'af': 4
     }],
-    'probes': [
-        {'requested': 3, 'type': 'asn', 'value': 12389, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 5, 'type': 'asn', 'value': 8402,  'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 5, 'type': 'asn', 'value': 25513, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 3, 'type': 'asn', 'value': 8359,  'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 3, 'type': 'asn', 'value': 3216,  'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 20485, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 1, 'type': 'asn', 'value': 25490, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 1, 'type': 'asn', 'value': 43727, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 4, 'type': 'asn', 'value': 12714, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 34757, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 29124, 'tags': {'include': ['system-ipv4-works']}},
-        {'requested': 2, 'type': 'asn', 'value': 12768, 'tags': {'include': ['system-ipv4-works']}}
-    ],
+    'probes': probes,
     'is_oneoff': True
 }
 
@@ -760,7 +783,7 @@ while time.time() - start_time < deadline_s:
             results = json.loads(response.read().decode())
         elapsed = int(time.time() - start_time)
         dlog(f'poll {attempt} [{elapsed}s/{deadline_s}s]: results={len(results)} stall={stall}')
-        if len(results) >= 33:
+        if len(results) >= requested_total:
             break
         if len(results) == last_n and len(results) > 0:
             stall += 1
@@ -772,6 +795,19 @@ while time.time() - start_time < deadline_s:
         last_n = len(results)
     except Exception as e:
         dlog(f'poll {attempt} error: {type(e).__name__}: {e}')
+
+# Знаменатель нельзя брать сразу после создания: Atlas ещё раздаёт зонды и
+# probes_scheduled какое-то время занижен. Читаем его ПОСЛЕ опроса.
+scheduled = requested_total
+try:
+    meta = api_get(f'{BASE}/measurements/{msm_id}/', timeout=15)
+    scheduled = max(scheduled, meta.get('probes_scheduled') or 0,
+                    meta.get('participant_count') or 0)
+except Exception as e:
+    dlog(f'final meta fetch: {type(e).__name__}: {e}')
+scheduled = max(scheduled, len(results))
+dlog(f'scheduled={scheduled} results={len(results)}')
+print(f'SCHED {scheduled}', flush=True)
 
 if debug:
     dlog(f'FINAL: total={len(results)} after {int(time.time()-start_time)}s')
@@ -787,20 +823,42 @@ if not results:
     sys.exit(0)
     sys.exit(0)
 
-blocked = 0
+# Три категории, а не две. Результат с TLS `alert` — это НЕ пробившийся зонд:
+# сертификата нет, сервер отказал в рукопожатии. Чаще всего дело в старой
+# прошивке зонда с легаси-шифрами, поэтому в знаменатель вердикта такие
+# результаты не идут, но и успехом они не являются.
+cert_ids = []
+alert_ids = []
 blocked_prb_ids = []
+all_prb_ids = []
+alert_desc = {}
+blocked_err = {}
 for probe in results:
-    if 'cert' in probe or 'method' in probe or 'alert' in probe:
-        pass 
+    pid = probe.get('prb_id')
+    if pid:
+        all_prb_ids.append(pid)
+    if 'cert' in probe:
+        cert_ids.append(pid)
+    elif 'alert' in probe:
+        alert_ids.append(pid)
+        d = probe.get('alert') or {}
+        k = str(d.get('description', 'unknown'))
+        alert_desc[k] = alert_desc.get(k, 0) + 1
     else:
-        blocked += 1
-        prb_id = probe.get('prb_id')
-        if prb_id:
-            blocked_prb_ids.append(prb_id)
+        blocked_prb_ids.append(pid)
+        # `connect: timeout` (SYN в никуда), `timeout reading hello` (TCP есть,
+        # режут ClientHello) и `connect: Connection refused` (прилетел RST) —
+        # это разные механизмы, и лечатся они по-разному
+        e = str(probe.get('err', 'no data')).strip() or 'no data'
+        blocked_err[e] = blocked_err.get(e, 0) + 1
 
 total = len(results)
-success = total - blocked
-print(f'OK {total} {success} {blocked}')
+blocked = len(blocked_prb_ids)
+print(f'OK {total} {len(cert_ids)} {blocked} {len(alert_ids)}', flush=True)
+if alert_desc:
+    print('ALERT_DESC ' + ' '.join(f'{k}:{v}' for k, v in alert_desc.items()), flush=True)
+for k, v in sorted(blocked_err.items(), key=lambda kv: -kv[1]):
+    print(f'BLOCK_ERR {v} {k}', flush=True)
 
 blocked_asns = {}
 if blocked_prb_ids:
@@ -877,29 +935,114 @@ PYEOF
     STATUS=$(echo "$FIRST_LINE" | awk '{print $1}')
 
     if [[ "$STATUS" == "OK" ]]; then
+      SCHED_LINE=$(echo "$ATLAS_RESULT" | grep '^SCHED ' | head -n1 | cut -d' ' -f2)
+      ALERT_DESC_LINE=$(echo "$ATLAS_RESULT" | grep '^ALERT_DESC ' | head -n1)
       TOTAL_PROBES=$(echo "$FIRST_LINE" | awk '{print $2}')
       SUCCESS_PROBES=$(echo "$FIRST_LINE" | awk '{print $3}')
       BLOCKED_PROBES=$(echo "$FIRST_LINE" | awk '{print $4}')
       
-      if (( TOTAL_PROBES > 0 )); then
-        SUCCESS_PERCENT=$(( SUCCESS_PROBES * 100 / TOTAL_PROBES ))
+      ALERT_PROBES=$(echo "$FIRST_LINE" | awk '{print $5}')
+      ALERT_PROBES=${ALERT_PROBES:-0}
+
+      # TLS-alert исключаем из знаменателя: это свойство клиента или SNI, а не
+      # блокировки. Но если алертов почти все, вердикт считался бы по единицам
+      # зондов — тогда его лучше не выносить вовсе (VERDICT_SHARE ниже).
+      VERDICT_BASE=$(( SUCCESS_PROBES + BLOCKED_PROBES ))
+      if (( VERDICT_BASE > 0 )); then
+        SUCCESS_PERCENT=$(( SUCCESS_PROBES * 100 / VERDICT_BASE ))
       else
         SUCCESS_PERCENT=0
       fi
-      
-      if (( SUCCESS_PERCENT == 100 )); then
-        COLOR=$GREEN
-        STAT_TEXT="ПОЛНЫЙ ДОСТУП ИЗ РФ"
-      elif (( SUCCESS_PERCENT > 50 )); then
-        COLOR=$YELLOW
-        STAT_TEXT="ЧАСТИЧНАЯ БЛОКИРОВКА IP (Дропы у части провайдеров)"
+      if (( TOTAL_PROBES > 0 )); then
+        VERDICT_SHARE=$(( VERDICT_BASE * 100 / TOTAL_PROBES ))
       else
-        COLOR=$RED
-        STAT_TEXT="КРИТИЧНАЯ БЛОКИРОВКА ТСПУ (IP недоступен)"
+        VERDICT_SHARE=0
       fi
 
-      echo -e "Зондов ответило: ${CYAN}${TOTAL_PROBES}${RESET} | Пробились: ${GREEN}${SUCCESS_PROBES}${RESET} | Заблокированы: ${RED}${BLOCKED_PROBES}${RESET}"
-      echo -e "ТСПУ Статус: ${COLOR}${SUCCESS_PERCENT}% ${STAT_TEXT}${RESET}"
+      SCHEDULED=${SCHED_LINE:-$TOTAL_PROBES}
+      (( SCHEDULED < TOTAL_PROBES )) && SCHEDULED=$TOTAL_PROBES
+      if (( SCHEDULED > 0 )); then
+        COVERAGE=$(( TOTAL_PROBES * 100 / SCHEDULED ))
+      else
+        COVERAGE=0
+      fi
+      (( COVERAGE > 100 )) && COVERAGE=100
+      
+      # Один сбой из полусотни зондов — шум, а не блокировка.
+      if (( SUCCESS_PERCENT >= 98 || BLOCKED_PROBES <= 1 )); then
+        COLOR=$GREEN
+        if (( SUCCESS_PERCENT == 100 )); then
+          STAT_TEXT="ПОЛНЫЙ ДОСТУП ИЗ РФ"
+        else
+          STAT_TEXT="ДОСТУП ЕСТЬ (${BLOCKED_PROBES} сбой из ${VERDICT_BASE} — в пределах шума)"
+        fi
+      elif (( SUCCESS_PERCENT > 50 )); then
+        COLOR=$YELLOW
+        STAT_TEXT="ЧАСТИЧНАЯ БЛОКИРОВКА (дропы у части провайдеров)"
+      else
+        COLOR=$RED
+        STAT_TEXT="КРИТИЧНАЯ БЛОКИРОВКА (IP недоступен из РФ)"
+      fi
+
+      if (( COVERAGE >= 90 )); then COV_COLOR=$GREEN
+      elif (( COVERAGE >= 50 )); then COV_COLOR=$YELLOW
+      else COV_COLOR=$RED; fi
+
+      echo -e "Зондов ответило: ${COV_COLOR}${TOTAL_PROBES} из ${SCHEDULED}${RESET} ${DIM}(покрытие ${COVERAGE}%)${RESET}"
+      echo -e "Пробились: ${GREEN}${SUCCESS_PROBES}${RESET} | Заблокированы: ${RED}${BLOCKED_PROBES}${RESET} | TLS-alert: ${YELLOW}${ALERT_PROBES}${RESET}"
+
+      if (( BLOCKED_PROBES > 0 )); then
+        echo "$ATLAS_RESULT" | grep '^BLOCK_ERR ' | while read -r _tag _cnt _err; do
+          _errl=$(printf '%s' "$_err" | tr '[:upper:]' '[:lower:]')
+          case "$_errl" in
+            *timeout\ reading\ hello*) _hint="TCP поднялся, режут ClientHello — DPI по SNI" ;;
+            *connection\ refused*)      _hint="прилетел TCP RST — либо порт закрыт, либо RST инжектится в путь" ;;
+            *network\ unreachable*)     _hint="нет маршрута до сети" ;;
+            *timeout*)                  _hint="SYN уходит, ответа нет — блэкхол на уровне IP" ;;
+            *) _hint="" ;;
+          esac
+          if [[ -n "$_hint" ]]; then
+            echo -e "${DIM}  ${_cnt} × ${_err} — ${_hint}${RESET}"
+          else
+            echo -e "${DIM}  ${_cnt} × ${_err}${RESET}"
+          fi
+        done
+      fi
+
+      if (( ALERT_PROBES > 0 )); then
+        ADESC=${ALERT_DESC_LINE#ALERT_DESC }
+        AOUT=""
+        for part in $ADESC; do
+          acode="${part%%:*}"; acnt="${part##*:}"
+          case "$acode" in
+            40)  aname="handshake_failure" ;;
+            47)  aname="illegal_parameter" ;;
+            48)  aname="unknown_ca" ;;
+            70)  aname="protocol_version" ;;
+            71)  aname="insufficient_security" ;;
+            112) aname="unrecognized_name" ;;
+            *)   aname="alert ${acode}" ;;
+          esac
+          AOUT+="${aname} ${acnt}, "
+        done
+        echo -e "${DIM}  из них TLS-alert:${RESET} ${AOUT%, }"
+        if [[ "$ADESC" == *112* ]]; then
+          echo -e "${YELLOW}  alert 112 = сервер не обслуживает такой SNI — проверьте --sni ${REALITY_SNI}${RESET}"
+        else
+          echo -e "${DIM}  обычно это старая прошивка зонда с легаси-шифрами, а не блокировка.${RESET}"
+          echo -e "${DIM}  проверить с нейтральной точки: openssl s_client -tls1_2 -cipher 'AES128-SHA:AES256-SHA' -servername ${REALITY_SNI} -connect ${RADAR_IP}:${RADAR_PORT}${RESET}"
+        fi
+      fi
+      if (( COVERAGE < 50 )); then
+        echo -e "ТСПУ Статус: ${YELLOW}НЕДОСТАТОЧНО ДАННЫХ${RESET} ${DIM}(ответило ${COVERAGE}% зондов)${RESET}"
+        echo -e "${DIM}Среди ответивших пробились ${SUCCESS_PERCENT}%, но выборки мало для вывода.${RESET}"
+        echo -e "${DIM}Результаты могут дособираться — увеличьте --timeout.${RESET}"
+      elif (( VERDICT_SHARE < 50 )); then
+        echo -e "ТСПУ Статус: ${YELLOW}ВЕРДИКТ НЕ ВЫНЕСЕН${RESET} ${DIM}(оценка легла бы на ${VERDICT_BASE} зондов из ${TOTAL_PROBES})${RESET}"
+        echo -e "${DIM}Остальные ${ALERT_PROBES} вернули TLS-alert и в вердикт не входят.${RESET}"
+      else
+        echo -e "ТСПУ Статус: ${COLOR}${SUCCESS_PERCENT}% ${STAT_TEXT}${RESET}"
+      fi
 
       if [[ -n "$BLOCKED_ASN_LINE" ]]; then
         BLOCKED_PARTS=${BLOCKED_ASN_LINE#BLOCKED_ASN }
