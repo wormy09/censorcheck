@@ -952,15 +952,21 @@ PYEOF
         SUCCESS_PERCENT=0
       fi
       
-      if (( SUCCESS_PERCENT == 100 )); then
+      # Одиночный сбой из полусотни зондов — это шум, а не блокировка. Пока
+      # формулировка про блокировку срабатывала на 97%, метка обесценивалась.
+      if (( SUCCESS_PERCENT >= 98 || BLOCKED_PROBES <= 1 )); then
         COLOR=$GREEN
-        STAT_TEXT="ПОЛНЫЙ ДОСТУП ИЗ РФ"
+        if (( SUCCESS_PERCENT == 100 )); then
+          STAT_TEXT="ПОЛНЫЙ ДОСТУП ИЗ РФ"
+        else
+          STAT_TEXT="ДОСТУП ЕСТЬ (${BLOCKED_PROBES} сбой из ${VERDICT_BASE} — в пределах шума)"
+        fi
       elif (( SUCCESS_PERCENT > 50 )); then
         COLOR=$YELLOW
-        STAT_TEXT="ЧАСТИЧНАЯ БЛОКИРОВКА IP (Дропы у части провайдеров)"
+        STAT_TEXT="ЧАСТИЧНАЯ БЛОКИРОВКА (дропы у части провайдеров)"
       else
         COLOR=$RED
-        STAT_TEXT="КРИТИЧНАЯ БЛОКИРОВКА ТСПУ (IP недоступен)"
+        STAT_TEXT="КРИТИЧНАЯ БЛОКИРОВКА (IP недоступен из РФ)"
       fi
 
       SCHEDULED=${SCHED_LINE:-$TOTAL_PROBES}
@@ -981,15 +987,20 @@ PYEOF
 
       if (( BLOCKED_PROBES > 0 )); then
         echo "$ATLAS_RESULT" | grep '^BLOCK_ERR ' | while read -r _tag _cnt _err; do
-          case "$_err" in
-            connect:\ timeout*)
-              _hint="SYN уходит, ответа нет — блэкхол на уровне IP (бан оператором)" ;;
-            timeout\ reading\ hello*)
+          # РЕГИСТР ВАЖЕН: RIPE отдает "Connection refused" с большой буквы,
+          # из-за чего ветка ниже раньше не срабатывала вовсе
+          _errl=$(printf '%s' "$_err" | tr '[:upper:]' '[:lower:]')
+          _extra=""
+          case "$_errl" in
+            *timeout\ reading\ hello*)
               _hint="TCP поднялся, режут ClientHello — DPI по SNI (ТСПУ)" ;;
-            connect:\ connection\ refused*)
-              _hint="хост жив, порт закрыт — это не блокировка" ;;
-            connect:\ network\ unreachable*)
+            *connection\ refused*)
+              _hint="пришел TCP RST — либо порт закрыт, либо RST инжектится в путь"
+              _extra="проверьте порт с нейтральной точки: nc -vz ${RADAR_IP} ${RADAR_PORT} — открыт снаружи, но refused из РФ = инжекция RST, т.е. блокировка" ;;
+            *network\ unreachable*)
               _hint="нет маршрута до сети" ;;
+            *timeout*)
+              _hint="SYN уходит, ответа нет — блэкхол на уровне IP (бан оператором)" ;;
             *) _hint="" ;;
           esac
           if [[ -n "$_hint" ]]; then
@@ -997,6 +1008,7 @@ PYEOF
           else
             echo -e "${DIM}  ${_cnt} × ${_err}${RESET}"
           fi
+          [[ -n "$_extra" ]] && echo -e "${YELLOW}    ${_extra}${RESET}"
         done
       fi
 
