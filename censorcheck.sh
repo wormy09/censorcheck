@@ -20,6 +20,10 @@ DEBUG=false
 RIPE_API_KEY="${RIPE_API_KEY:-}"
 REALITY_SNI="max.ru"
 NO_PROMPT=false
+RADAR_TARGET=""            # по умолчанию — внешний IPv4 этой машины
+RADAR_PORT=443             # порт, к которому подключаются зонды
+RADAR_DEADLINE=240         # сек, сколько ждать результаты зондов
+SKIP_LISTEN_CHECK=false
 
 usage() {
   cat <<'USAGE'
@@ -28,8 +32,17 @@ censorcheck.sh [опции]
   -v, --verbose        подробный вывод по доменам
   -d, --debug          debug-лог радара RIPE Atlas
   -k, --key <uuid>     ключ RIPE Atlas (или переменная окружения RIPE_API_KEY)
+  -s, --sni <hostname> SNI для TLS-хендшейка зондов (по умолчанию max.ru)
+  -t, --target <ip>    проверять чужой IP, а не свой (включает --no-listen-check)
+  -p, --port <port>    порт для зондов, по умолчанию 443
+      --timeout <sec>  ждать результаты столько секунд, по умолчанию 240
+      --no-listen-check  не проверять локального слушателя
       --no-prompt      не спрашивать ключ интерактивно
   -h, --help           эта справка
+
+Примеры:
+  ./censorcheck.sh --key <uuid> --target 192.0.2.10 --sni panel.example.com
+  ./censorcheck.sh --key <uuid> --target 192.0.2.20 --port 8443 --sni www.example.net
 
 Ключ создается за минуту на https://atlas.ripe.net/keys/ — нужно ровно одно
 право, "Schedule a new measurement". Без ключа отрабатывает только проверка
@@ -53,6 +66,28 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-prompt)
       NO_PROMPT=true
+      shift
+      ;;
+    -s|--sni)
+      REALITY_SNI="$2"
+      shift 2
+      ;;
+    -t|--target)
+      # чужой хост — локальная проверка слушателя для него бессмысленна
+      RADAR_TARGET="$2"
+      SKIP_LISTEN_CHECK=true
+      shift 2
+      ;;
+    -p|--port)
+      RADAR_PORT="$2"
+      shift 2
+      ;;
+    --timeout)
+      RADAR_DEADLINE="$2"
+      shift 2
+      ;;
+    --no-listen-check)
+      SKIP_LISTEN_CHECK=true
       shift
       ;;
     -h|--help)
@@ -581,7 +616,9 @@ if [[ -n "$CURRENT_ASN" ]]; then
 fi
 echo
 
-if [[ -n "$CURRENT_IP" ]]; then
+RADAR_IP="${RADAR_TARGET:-$CURRENT_IP}"
+
+if [[ -n "$RADAR_IP" ]]; then
   echo "$LINE_SEP"
 
   if [[ -z "$RIPE_API_KEY" ]]; then
@@ -589,8 +626,12 @@ if [[ -n "$CURRENT_IP" ]]; then
     echo -e "${DIM}Создать: https://atlas.ripe.net/keys/ (право Schedule a new measurement)${RESET}"
     echo -e "${DIM}Затем: ./censorcheck.sh --key <uuid>   или   export RIPE_API_KEY=<uuid>${RESET}"
   # Чекер 443 порта, нужен для Atlas
-  elif ! ss -tuln 2>/dev/null | grep -qE "(0\.0\.0\.0|\*|$CURRENT_IP):443\b"; then
-    echo -e "${DIM}Радар ТСПУ отменен. Для корректной проверки запустите VPN (Xray/3X-UI)${RESET}"
+  # Проверка локального слушателя осмысленна только когда цель — эта же машина.
+  # command -v ss: на macOS ss нет вообще, без этого радар там не запускается.
+  elif [[ "$SKIP_LISTEN_CHECK" == false ]] && command -v ss >/dev/null 2>&1 \
+       && ! ss -tuln 2>/dev/null | grep -qE "(0\.0\.0\.0|\*|$CURRENT_IP):${RADAR_PORT}\b"; then
+    echo -e "${DIM}Радар ТСПУ отменен: на :${RADAR_PORT} локально никто не слушает.${RESET}"
+    echo -e "${DIM}Запустите VPN (Xray/3X-UI), либо укажите --target <ip> для чужого хоста.${RESET}"
   else
     echo -e "Опрос сетей РФ: РТК, МТС, МГТС, Билайн, ТТК, РТК-Юг, Мегафон .."
     
@@ -607,12 +648,14 @@ api_key = sys.argv[1]
 target_ip = sys.argv[2]
 sni = sys.argv[3]
 debug = (len(sys.argv) > 4 and sys.argv[4] == 'true')
+deadline_s = int(sys.argv[5]) if len(sys.argv) > 5 else 240
+port = int(sys.argv[6]) if len(sys.argv) > 6 else 443
 
 def dlog(msg):
     if debug:
         print(f'[DEBUG] {msg}', file=sys.stderr, flush=True)
 
-dlog(f'target_ip={target_ip} sni={sni}')
+dlog(f'target_ip={target_ip} port={port} sni={sni} deadline={deadline_s}')
 
 BASE = 'https://atlas.ripe.net/api/v2'
 
@@ -648,7 +691,7 @@ data = {
         'target': target_ip, 
         'description': 'Reality TLS Handshake',
         'type': 'sslcert',
-        'port': 443,
+        'port': port,
         'hostname': sni,
         'af': 4
     }],
@@ -676,6 +719,9 @@ try:
     with urllib.request.urlopen(req, timeout=30) as response:
         msm_id = json.loads(response.read().decode())['measurements'][0]
         dlog(f'measurement_id={msm_id}')
+        # печатаем сразу: bash покажет ссылку во время ожидания, и прерывание
+        # больше не теряет уже оплаченное измерение
+        print(f'MSM {msm_id}', flush=True)
 except urllib.error.HTTPError as e:
     body = ''
     try:
@@ -700,17 +746,32 @@ results_url = f'https://atlas.ripe.net/api/v2/measurements/{msm_id}/results/'
 results = []
 start_time = time.time()
 
-for attempt in range(25):
-    time.sleep(2)
+# Раньше окно было жестко 25 x 2 s = 50 s. Одноразовые измерения RIPE
+# регулярно собираются дольше, и результаты просто терялись.
+attempt = 0
+last_n = -1
+stall = 0
+STALL_POLLS = 15   # 15 x 3s = 45s без новых результатов -> считаем, что все
+while time.time() - start_time < deadline_s:
+    time.sleep(3)
+    attempt += 1
     try:
-        with urllib.request.urlopen(results_url) as response:
+        with urllib.request.urlopen(results_url, timeout=20) as response:
             results = json.loads(response.read().decode())
-            elapsed = int(time.time() - start_time)
-            dlog(f'poll {attempt+1}/25 [{elapsed}s]: results={len(results)}/33')
-            if len(results) >= 33: 
+        elapsed = int(time.time() - start_time)
+        dlog(f'poll {attempt} [{elapsed}s/{deadline_s}s]: results={len(results)} stall={stall}')
+        if len(results) >= 33:
+            break
+        if len(results) == last_n and len(results) > 0:
+            stall += 1
+            if stall >= STALL_POLLS:
+                dlog(f'no new results for {STALL_POLLS * 3}s, stopping')
                 break
+        else:
+            stall = 0
+        last_n = len(results)
     except Exception as e:
-        dlog(f'poll {attempt+1} error: {type(e).__name__}: {e}')
+        dlog(f'poll {attempt} error: {type(e).__name__}: {e}')
 
 if debug:
     dlog(f'FINAL: total={len(results)} after {int(time.time()-start_time)}s')
@@ -760,7 +821,7 @@ if blocked_asns:
     parts = ' '.join(f'{asn}:{cnt}' for asn, cnt in blocked_asns.items())
     print(f'BLOCKED_ASN {parts}')
 PYEOF
-    python3 "$TMP_PY" "$RIPE_API_KEY" "$CURRENT_IP" "$REALITY_SNI" "$DEBUG" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
+    python3 "$TMP_PY" "$RIPE_API_KEY" "$RADAR_IP" "$REALITY_SNI" "$DEBUG" "$RADAR_DEADLINE" "$RADAR_PORT" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
     
     ATLAS_PID=$!
 
@@ -768,8 +829,15 @@ PYEOF
     wave_len=${#wave[@]}
     i=0
     
-    tput civis 2>/dev/null 
-    
+    tput civis 2>/dev/null
+
+    RADAR_T0=$(date +%s)
+    MSM_SHOWN=""
+
+    # Ctrl-C во время ожидания больше не теряет измерение: оно уже создано на
+    # стороне RIPE, кредиты списаны, и результаты доедут независимо от нас.
+    trap 'tput cnorm 2>/dev/null; echo; MID=$(grep -m1 "^MSM " "$TMP_ATLAS" 2>/dev/null | cut -d" " -f2); [ -n "$MID" ] && echo "Прервано. Измерение продолжается: https://atlas.ripe.net/measurements/$MID/"; exit 130' INT
+
     while kill -0 $ATLAS_PID 2>/dev/null; do
       pulse=""
       for (( k=0; k<8; k++ )); do
@@ -781,20 +849,30 @@ PYEOF
           3) pulse+="${GREEN}${wave[$idx]}${RESET}" ;;
         esac
       done
-      printf "\r${CYAN}Запуск радара ТСПУ (Ожидайте проверки)${RESET} %b\e[K" "$pulse"
+      if [[ -z "$MSM_SHOWN" ]] && (( i % 10 == 0 )); then
+        MSM_LIVE=$(grep -m1 "^MSM " "$TMP_ATLAS" 2>/dev/null | cut -d" " -f2)
+        if [[ -n "$MSM_LIVE" ]]; then
+          printf "\r\e[K${DIM}Измерение: https://atlas.ripe.net/measurements/%s/${RESET}\n" "$MSM_LIVE"
+          MSM_SHOWN=1
+        fi
+      fi
+      RADAR_ELAPSED=$(( $(date +%s) - RADAR_T0 ))
+      printf "\r${CYAN}Запуск радара ТСПУ${RESET} ${DIM}(%ss / до %ss)${RESET} %b\e[K" \
+        "$RADAR_ELAPSED" "$RADAR_DEADLINE" "$pulse"
       sleep 0.1
       ((i++))
     done
     
     wait $ATLAS_PID
-    tput cnorm 2>/dev/null 
+    tput cnorm 2>/dev/null
+    trap - INT 
     
     printf "\r${CYAN}Запуск радара ТСПУ${RESET}\e[K\n"
 
     ATLAS_RESULT=$(cat "$TMP_ATLAS")
     rm -f "$TMP_ATLAS" "$TMP_PY"
 
-    FIRST_LINE=$(echo "$ATLAS_RESULT" | head -n1)
+    FIRST_LINE=$(echo "$ATLAS_RESULT" | grep -E '^(OK|ERROR) ' | head -n1)
     BLOCKED_ASN_LINE=$(echo "$ATLAS_RESULT" | grep "^BLOCKED_ASN" | head -n1)
     STATUS=$(echo "$FIRST_LINE" | awk '{print $1}')
 
