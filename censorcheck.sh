@@ -603,7 +603,12 @@ if [[ -n "$RADAR_IP" ]]; then
     
     TMP_ATLAS=$(mktemp)
     TMP_ATLAS_DEBUG=$(mktemp)
-    python3 -c "
+    # Python идет через КАВЫЧЕЧНЫЙ heredoc (<<'PYEOF') во временный файл, а не
+    # через python3 -c "...". Внутри двойных кавычек bash раскрывает $ и `...`
+    # и закрывает строку на первой же кавычке: один комментарий с кавычками рвал
+    # программу пополам и сдвигал sys.argv. В <<'PYEOF' не раскрывается НИЧЕГО.
+    TMP_PY=$(mktemp)
+    cat > "$TMP_PY" <<'PYEOF'
 import sys, json, time, urllib.request, urllib.error
 
 api_key    = sys.argv[1]
@@ -845,7 +850,8 @@ if seen:
           for a, c in sorted(seen.items(), key=lambda kv: -kv[1])), flush=True)
 if blk:
     print('BLOCKED_ASN ' + ' '.join(str(a) + ':' + str(c) for a, c in blk.items()), flush=True)
-    " "$RIPE_API_KEY" "$RADAR_IP" "$REALITY_SNI" "$DEBUG" "$RADAR_DEADLINE" "$RADAR_PORT" "$RADAR_PROBES" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
+PYEOF
+    python3 "$TMP_PY" "$RIPE_API_KEY" "$RADAR_IP" "$REALITY_SNI" "$DEBUG" "$RADAR_DEADLINE" "$RADAR_PORT" "$RADAR_PROBES" > "$TMP_ATLAS" 2>"$TMP_ATLAS_DEBUG" &
     
     ATLAS_PID=$!
 
@@ -904,7 +910,7 @@ if blk:
     printf "\r${CYAN}Запуск радара ТСПУ${RESET}\e[K\n"
 
     ATLAS_RESULT=$(cat "$TMP_ATLAS")
-    rm -f "$TMP_ATLAS"
+    rm -f "$TMP_ATLAS" "$TMP_PY"
 
     FIRST_LINE=$(echo "$ATLAS_RESULT" | grep -E '^(OK|ERROR) ' | head -n1)
     SCHED_LINE=$(echo "$ATLAS_RESULT" | grep '^SCHED ' | head -n1 | cut -d' ' -f2)
