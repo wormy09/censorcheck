@@ -44,8 +44,8 @@ censorcheck.sh [опции]
   -h, --help               эта справка
 
 Примеры:
-  ./censorcheck.sh --key <uuid> --target 185.113.11.151 --sni sub.wormyvpn.com
-  ./censorcheck.sh --key <uuid> --target 193.57.9.93 --port 8443 --sni www.transip.nl
+  ./censorcheck.sh --key <uuid> --target 192.0.2.10 --sni panel.example.com
+  ./censorcheck.sh --key <uuid> --target 192.0.2.20 --port 8443 --sni www.example.net
 USAGE
 }
 
